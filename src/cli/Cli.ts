@@ -83,16 +83,53 @@ const now = Command.make("now", { zone: zoneOpt, json: jsonOpt }, ({ zone, json 
   )
 )
 
-// ---- search-then-act commands ----
-const playTrack = Command.make("play", { query: queryArg, zone: zoneOpt }, ({ query, zone }) =>
+// ---- search-then-act / transport-aware play ----
+
+/**
+ * `play` overloads:
+ *   - `play <query>`   → search Tracks, replace queue
+ *   - `play`           → idempotent transport play (resume if paused/stopped, no-op if playing)
+ */
+const optionalQuery = Args.text({ name: "query" }).pipe(Args.optional)
+
+const playTrack = Command.make(
+  "play",
+  { query: optionalQuery, zone: zoneOpt },
+  ({ query, zone }) =>
+    Effect.gen(function* () {
+      const roon = yield* RoonClient
+      const sessions = yield* Sessions
+      const zs = yield* roon.getZones
+      const target = yield* pickZone(zs, zone)
+      if (Option.isNone(query)) {
+        if (target.state === "playing") {
+          yield* Console.log(`already playing → ${target.display_name}`)
+          return
+        }
+        yield* roon.control(target.zone_id, "play")
+        yield* Console.log(`▶ resume → ${target.display_name}`)
+        return
+      }
+      const resolved = yield* roon.searchAndPlay(target.zone_id, query.value)
+      yield* sessions.append({ action: "play", zone: target.display_name, query: query.value, resolved })
+      yield* Console.log(`▶ ${resolved}  →  ${target.display_name}`)
+    })
+)
+
+/**
+ * Idempotent pause — no-op if already paused/stopped.
+ */
+const pauseCmd = Command.make("pause", { zone: zoneOpt }, ({ zone }) =>
   Effect.gen(function* () {
     const roon = yield* RoonClient
-    const sessions = yield* Sessions
     const zs = yield* roon.getZones
     const target = yield* pickZone(zs, zone)
-    const resolved = yield* roon.searchAndPlay(target.zone_id, query)
-    yield* sessions.append({ action: "play", zone: target.display_name, query, resolved })
-    yield* Console.log(`▶ ${resolved}  →  ${target.display_name}`)
+    if (target.state !== "playing") {
+      yield* Console.log(`already ${target.state} → ${target.display_name}`)
+      return
+    }
+    yield* roon.control(target.zone_id, "pause")
+    yield* Console.log(`paused → ${target.display_name}`)
   })
 )
 
@@ -156,13 +193,13 @@ const playArtist = Command.make("play-artist", { query: queryArg, zone: zoneOpt 
   })
 )
 
-// ---- transport ----
-const transport = (action: TransportAction) =>
-  Command.make(action, { zone: zoneOpt }, ({ zone }) =>
+// ---- non-idempotent / one-shot transport (next, previous, stop) ----
+const transport = (action: TransportAction, label = action) =>
+  Command.make(label, { zone: zoneOpt }, ({ zone }) =>
     withZone(zone, (target) =>
       RoonClient.pipe(
         Effect.flatMap((roon) => roon.control(target.zone_id, action)),
-        Effect.flatMap(() => Console.log(`${action} → ${target.display_name}`))
+        Effect.flatMap(() => Console.log(`${label} → ${target.display_name}`))
       )
     )
   )
@@ -448,8 +485,7 @@ const root = Command.make("sth-dj").pipe(
     playAlbum,
     queueAlbum,
     playArtist,
-    transport("pause"),
-    transport("playpause"),
+    pauseCmd,
     transport("next"),
     transport("previous"),
     transport("stop"),

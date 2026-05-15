@@ -232,6 +232,7 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
         Match.when({ name: "Success" }, () => Effect.void),
         Match.when(undefined, () => Effect.void),
         Match.when(null, () => Effect.void),
+        Match.when(false, () => Effect.void),
         Match.orElse((m) =>
           Effect.fail(
             new RoonTransportFailed({ action, reason: JSON.stringify(m).slice(0, 200) })
