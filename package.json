@@ -1,0 +1,41 @@
+{
+  "name": "sth-dj",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.1.2",
+  "engines": {
+    "node": ">=22",
+    "pnpm": ">=11"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": []
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./core": "./src/core/index.ts",
+    "./core/*": "./src/core/*.ts"
+  },
+  "bin": {
+    "sth-dj": "./bin/sth-dj.ts"
+  },
+  "scripts": {
+    "dj": "node --experimental-strip-types --no-warnings=ExperimentalWarning bin/sth-dj.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@effect/cli": "^0.75.1",
+    "@effect/platform": "^0.96.1",
+    "@effect/platform-node": "^0.106.0",
+    "@roonlabs/node-roon-api": "^1.2.3",
+    "effect": "^3.21.2",
+    "node-roon-api-browse": "github:RoonLabs/node-roon-api-browse",
+    "node-roon-api-image": "github:RoonLabs/node-roon-api-image",
+    "node-roon-api-status": "github:RoonLabs/node-roon-api-status",
+    "node-roon-api-transport": "github:RoonLabs/node-roon-api-transport"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.2",
+    "typescript": "^6.0.3"
+  }
+}

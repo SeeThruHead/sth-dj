@@ -1,0 +1,14 @@
+packages: []
+
+minimumReleaseAge: 10080
+preferFrozenLockfile: true
+autoInstallPeers: true
+strictPeerDependencies: true
+engineStrict: true
+packageManagerStrict: true
+
+onlyBuiltDependencies: []
+
+allowBuilds:
+  '@parcel/watcher': false
+  msgpackr-extract: false
