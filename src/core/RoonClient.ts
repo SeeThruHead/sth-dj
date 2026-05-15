@@ -1,11 +1,10 @@
-import { Deferred, Effect, Match, MutableRef, Option, Ref, Schema } from "effect"
+import { Deferred, Effect, Match, MutableRef, Option, Ref, Schedule, Schema } from "effect"
 import { FileSystem } from "@effect/platform"
 import RoonApi from "@roonlabs/node-roon-api"
 import RoonApiTransport from "node-roon-api-transport"
 import RoonApiBrowse from "node-roon-api-browse"
 import RoonApiImage from "node-roon-api-image"
 import RoonApiStatus from "node-roon-api-status"
-import { ensureDir, fileExists, readJsonAs } from "./Config.ts"
 import { Paths } from "./Paths.ts"
 
 // ---- public types ----
@@ -25,12 +24,22 @@ export type RoonZone = {
 }
 
 export type TransportAction = "play" | "pause" | "playpause" | "stop" | "previous" | "next"
+export type PlayMode = "play_now" | "queue" | "play_next"
 
 export type BrowseItem = {
   title: string
   subtitle?: string
   item_key?: string
   hint?: string
+}
+
+export type QueueItem = {
+  queue_item_id: number
+  image_key?: string
+  length?: number
+  one_line?: { line1: string }
+  two_line?: { line1: string; line2: string }
+  three_line?: { line1: string; line2: string; line3: string }
 }
 
 // ---- errors ----
@@ -70,6 +79,26 @@ type RawCore = {
     RoonApiTransport: {
       get_zones: (cb: (msg: unknown, body: { zones?: RoonZone[] }) => void) => void
       control: (zone: string, action: TransportAction, cb?: (msg: unknown) => void) => void
+      seek: (
+        zone: string,
+        how: "relative" | "absolute",
+        seconds: number,
+        cb?: (msg: unknown) => void
+      ) => void
+      change_volume: (
+        output: string,
+        how: "absolute" | "relative" | "relative_step",
+        value: number,
+        cb?: (msg: unknown) => void
+      ) => void
+      mute: (output: string, how: "mute" | "unmute", cb?: (msg: unknown) => void) => void
+      change_settings: (zone: string, settings: object, cb?: (msg: unknown) => void) => void
+      play_from_here: (output: string, queue_item_id: number, cb?: (msg: unknown) => void) => void
+      subscribe_queue: (
+        zone: string,
+        max: number,
+        cb: (response: string, body: { items?: QueueItem[]; changes?: unknown }) => void
+      ) => void
     }
     RoonApiBrowse: {
       browse: (opts: BrowseOpts, cb: (msg: unknown, body: BrowseResponse | undefined) => void) => void
@@ -84,22 +113,23 @@ type BrowseOpts = {
   input?: string
   pop_all?: boolean
   zone_or_output_id?: string
+  multi_session_key?: string
 }
-type LoadOpts = { hierarchy: string; level?: number; offset?: number; count?: number }
+type LoadOpts = {
+  hierarchy: string
+  level?: number
+  offset?: number
+  count?: number
+  multi_session_key?: string
+}
 type BrowseResponse = { action: "list" | "message" | "none"; message?: string }
 type LoadResponse = { items: BrowseItem[]; offset: number; list: { count: number; level: number } }
 
 const PersistedState = Schema.Record({ key: Schema.String, value: Schema.Unknown })
 type PersistedState = Schema.Schema.Type<typeof PersistedState>
 
-/**
- * FFI boundary with node-roon-api. The library is callback-based and exposes
- * synchronous getters (get_persisted_state) that can't be Effects, so we
- * confine the imperatives to one Effect.try wrapping the whole hand-off:
- *  - `state` lives in a MutableRef (synchronous read for the get callback)
- *  - `onPersist` is fired after every set so callers can flush to disk
- *  - `onPaired` is fired once the core completes the auth handshake
- */
+// ---- FFI bridge (sealed, see comment) ----
+
 const acquireRoon = (
   initialState: PersistedState,
   onPersist: (s: PersistedState) => void,
@@ -141,17 +171,22 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
   effect: Effect.gen(function* () {
     const paths = yield* Paths
     const fs = yield* FileSystem.FileSystem
-    yield* ensureDir(paths.configDir).pipe(
+    yield* fs.makeDirectory(paths.configDir, { recursive: true }).pipe(
       Effect.mapError((cause) => new RoonPairingFailed({ reason: `config dir: ${cause}` }))
     )
 
     const persistedRef = yield* Ref.make<PersistedState>({})
-
-    // Load persisted token if present
-    yield* fileExists(paths.roonStateFile).pipe(
+    yield* fs.exists(paths.roonStateFile).pipe(
+      Effect.orElseSucceed(() => false),
       Effect.flatMap((exists) =>
         exists
-          ? readJsonAs(paths.roonStateFile, PersistedState).pipe(
+          ? fs.readFileString(paths.roonStateFile).pipe(
+              Effect.flatMap((txt) =>
+                Effect.try({
+                  try: () => JSON.parse(txt) as PersistedState,
+                  catch: () => null
+                }).pipe(Effect.catchAll(() => Effect.succeed({} as PersistedState)))
+              ),
               Effect.flatMap((s) => Ref.set(persistedRef, s)),
               Effect.catchAll(() => Effect.void)
             )
@@ -170,7 +205,6 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
       const updated = yield* Ref.modify(startedRef, (current) =>
         Option.isSome(current) ? [current.value, current] : [deferred, Option.some(deferred)]
       )
-      // First caller owns startup
       if (updated === deferred) {
         const initial = yield* Ref.get(persistedRef)
         const persist = (s: PersistedState) =>
@@ -191,7 +225,19 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
 
     const waitForCore = ensureStarted.pipe(Effect.flatMap(Deferred.await))
 
-    // ---- callback wrapping helpers ----
+    // ---- callback wrappers ----
+
+    const successOrFail = (action: string) => (msg: unknown) =>
+      Match.value(msg).pipe(
+        Match.when({ name: "Success" }, () => Effect.void),
+        Match.when(undefined, () => Effect.void),
+        Match.when(null, () => Effect.void),
+        Match.orElse((m) =>
+          Effect.fail(
+            new RoonTransportFailed({ action, reason: JSON.stringify(m).slice(0, 200) })
+          )
+        )
+      )
 
     const tryGetZones = (core: RawCore) =>
       Effect.async<RoonZone[], RoonTransportFailed>((resume) => {
@@ -210,18 +256,56 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
 
     const tryControl = (core: RawCore, zoneId: string, action: TransportAction) =>
       Effect.async<void, RoonTransportFailed>((resume) => {
-        core.services.RoonApiTransport.control(zoneId, action, (msg) => {
-          const matchResult = Match.value(msg).pipe(
-            Match.when({ name: "Success" }, () => Effect.void),
-            Match.when(undefined, () => Effect.void),
-            Match.when(null, () => Effect.void),
-            Match.orElse((m) =>
-              Effect.fail(
-                new RoonTransportFailed({ action, reason: JSON.stringify(m).slice(0, 200) })
-              )
-            )
-          )
-          resume(matchResult)
+        core.services.RoonApiTransport.control(zoneId, action, (msg) =>
+          resume(successOrFail(action)(msg))
+        )
+      })
+
+    const trySeek = (core: RawCore, zoneId: string, seconds: number, mode: "absolute" | "relative") =>
+      Effect.async<void, RoonTransportFailed>((resume) => {
+        core.services.RoonApiTransport.seek(zoneId, mode, seconds, (msg) =>
+          resume(successOrFail(`seek ${mode}`)(msg))
+        )
+      })
+
+    const tryChangeVolume = (core: RawCore, outputId: string, value: number, mode: "absolute" | "relative" | "relative_step") =>
+      Effect.async<void, RoonTransportFailed>((resume) => {
+        core.services.RoonApiTransport.change_volume(outputId, mode, value, (msg) =>
+          resume(successOrFail(`volume ${mode}`)(msg))
+        )
+      })
+
+    const tryMute = (core: RawCore, outputId: string, on: boolean) =>
+      Effect.async<void, RoonTransportFailed>((resume) => {
+        core.services.RoonApiTransport.mute(outputId, on ? "mute" : "unmute", (msg) =>
+          resume(successOrFail(on ? "mute" : "unmute")(msg))
+        )
+      })
+
+    const tryChangeSettings = (core: RawCore, zoneId: string, settings: object) =>
+      Effect.async<void, RoonTransportFailed>((resume) => {
+        core.services.RoonApiTransport.change_settings(zoneId, settings, (msg) =>
+          resume(successOrFail("change_settings")(msg))
+        )
+      })
+
+    const tryPlayFromHere = (core: RawCore, outputId: string, queueItemId: number) =>
+      Effect.async<void, RoonTransportFailed>((resume) => {
+        core.services.RoonApiTransport.play_from_here(outputId, queueItemId, (msg) =>
+          resume(successOrFail("play_from_here")(msg))
+        )
+      })
+
+    /**
+     * Subscribe just long enough to capture one queue snapshot, then unsubscribe.
+     * The Roon transport pushes initial items on subscription.
+     */
+    const tryGetQueue = (core: RawCore, zoneOrOutputId: string, max: number) =>
+      Effect.async<QueueItem[], RoonTransportFailed>((resume) => {
+        core.services.RoonApiTransport.subscribe_queue(zoneOrOutputId, max, (response, body) => {
+          if (response === "Subscribed" && body.items) {
+            resume(Effect.succeed(body.items))
+          }
         })
       })
 
@@ -268,61 +352,272 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
     const control = (zoneId: string, action: TransportAction) =>
       waitForCore.pipe(Effect.flatMap((core) => tryControl(core, zoneId, action)))
 
-    const searchAndPlay = (zoneOrOutputId: string, query: string) =>
+    const seek = (zoneId: string, seconds: number, mode: "absolute" | "relative" = "absolute") =>
+      waitForCore.pipe(Effect.flatMap((core) => trySeek(core, zoneId, seconds, mode)))
+
+    const setVolume = (outputId: string, value: number, mode: "absolute" | "relative" | "relative_step" = "absolute") =>
+      waitForCore.pipe(Effect.flatMap((core) => tryChangeVolume(core, outputId, value, mode)))
+
+    const setMute = (outputId: string, on: boolean) =>
+      waitForCore.pipe(Effect.flatMap((core) => tryMute(core, outputId, on)))
+
+    const changeSettings = (zoneId: string, settings: { shuffle?: boolean; loop?: "loop" | "loop_one" | "disabled"; auto_radio?: boolean }) =>
+      waitForCore.pipe(Effect.flatMap((core) => tryChangeSettings(core, zoneId, settings)))
+
+    const getQueue = (zoneOrOutputId: string, max = 200) =>
+      waitForCore.pipe(Effect.flatMap((core) => tryGetQueue(core, zoneOrOutputId, max)))
+
+    const playFromHere = (outputId: string, queueItemId: number) =>
+      waitForCore.pipe(Effect.flatMap((core) => tryPlayFromHere(core, outputId, queueItemId)))
+
+    /**
+     * Heuristic queue-clear: queue + skip past every item except the now-playing one,
+     * then optionally pause. Roon has no first-class clear; replace via a fresh Play Now
+     * is the supported way. This best-effort variant is safe to call.
+     */
+    const clearQueue = (zoneId: string, outputId: string) =>
+      Effect.gen(function* () {
+        const items = yield* getQueue(zoneId, 1000)
+        if (items.length === 0) return
+        const last = items[items.length - 1]
+        if (last) yield* playFromHere(outputId, last.queue_item_id).pipe(Effect.ignore)
+        yield* control(zoneId, "stop").pipe(Effect.ignore)
+      })
+
+    // ---- search ----
+
+    const actionMatchers: Record<PlayMode, (title: string) => boolean> = {
+      play_now: (t) => t.includes("play now") || t === "play",
+      queue: (t) => (t.includes("queue") || t.includes("add to queue")) && !t.includes("clear"),
+      play_next: (t) => t.includes("play next") || t.includes("add next")
+    }
+
+    type SearchSection = "Tracks" | "Albums" | "Artists" | "Composers" | "Works"
+
+    /**
+     * Submits a search via the dedicated `hierarchy: "search"`, drills into the
+     * requested section (default Tracks), picks the first item, then activates
+     * the action matching `mode`.
+     */
+    const searchAndAct = (
+      zoneOrOutputId: string,
+      query: string,
+      mode: PlayMode,
+      section: SearchSection = "Tracks"
+    ) =>
       Effect.gen(function* () {
         const core = yield* waitForCore
-        const browseInZone = (opts: Omit<BrowseOpts, "hierarchy" | "zone_or_output_id">, stage: string) =>
+        const inSearch = (opts: Partial<BrowseOpts>, stage: string) =>
           tryBrowse(
             core,
-            { hierarchy: "browse", zone_or_output_id: zoneOrOutputId, ...opts },
+            { hierarchy: "search", zone_or_output_id: zoneOrOutputId, ...opts },
             stage
           )
-        const loadList = (stage: string) => tryLoad(core, { hierarchy: "browse" }, stage)
+        const loadHere = (stage: string) => tryLoad(core, { hierarchy: "search" }, stage)
 
-        // 1. Reset to root, find Search
-        yield* browseInZone({ pop_all: true }, "open root")
-        const root = (yield* loadList("load root")).items
-        const searchEntry = root.find((i) => i.title.toLowerCase() === "search")
-        if (!searchEntry?.item_key) {
+        // 1. Submit search
+        yield* inSearch({ pop_all: true, input: query }, "submit search")
+        const sectionsRes = yield* loadHere("load search root")
+        const sectionItem = sectionsRes.items.find((i) => i.title === section)
+        if (!sectionItem?.item_key) {
           return yield* Effect.fail(
-            new NoSearchResult({ query, hint: "Search entry not present in browse root" })
+            new NoSearchResult({ query, hint: `no ${section} section in search results` })
           )
         }
 
-        // 2. Open Search prompt and submit query
-        yield* browseInZone({ item_key: searchEntry.item_key }, "open search")
-        yield* browseInZone({ input: query }, "submit query")
-        const results = (yield* loadList("load results")).items
-
-        // 3. Prefer Tracks section if present, else first playable
-        const tracksSection = results.find((i) => i.title.toLowerCase() === "tracks")
-        const candidate = yield* (tracksSection?.item_key
-          ? browseInZone({ item_key: tracksSection.item_key }, "open tracks").pipe(
-              Effect.flatMap(() => loadList("load tracks")),
-              Effect.map((res) => res.items[0])
-            )
-          : Effect.succeed(results.find((i) => i.item_key)))
+        // 2. Drill into section
+        yield* inSearch({ item_key: sectionItem.item_key }, `open ${section}`)
+        const items = (yield* loadHere(`load ${section}`)).items
+        const candidate = items.find((i) => i.item_key)
         if (!candidate?.item_key) {
           return yield* Effect.fail(
-            new NoSearchResult({ query, hint: "no playable result for query" })
+            new NoSearchResult({ query, hint: `no playable item in ${section}` })
           )
         }
 
-        // 4. Activate item, find a Play action, fire it
-        yield* browseInZone({ item_key: candidate.item_key }, "open item")
-        const actions = (yield* loadList("load actions")).items
-        const playNow =
-          actions.find((a) => a.title.toLowerCase().includes("play now")) ??
-          actions.find((a) => a.title.toLowerCase().includes("play"))
-        if (!playNow?.item_key) {
+        // 3. Drill until we hit an action menu (items with hint: "action").
+        //    Roon represents track items with hint "action_list" — clicking one
+        //    yields a wrapper level with another action_list before the actual
+        //    actions appear. Keep drilling on single-action_list responses up to
+        //    a small depth to avoid infinite loops.
+        let currentKey = candidate.item_key
+        let actionItems: BrowseItem[] = []
+        for (let depth = 0; depth < 4; depth++) {
+          yield* inSearch({ item_key: currentKey }, `drill depth ${depth}`)
+          const loaded = yield* loadHere(`load depth ${depth}`)
+          const allActions = loaded.items.length > 0 && loaded.items.every((i) => i.hint === "action")
+          if (allActions) {
+            actionItems = loaded.items
+            break
+          }
+          const next = loaded.items.find((i) => i.item_key)
+          if (!next?.item_key) break
+          currentKey = next.item_key
+        }
+        if (actionItems.length === 0) {
           return yield* Effect.fail(
-            new NoSearchResult({ query, hint: `no Play action for "${candidate.title}"` })
+            new NoSearchResult({
+              query,
+              hint: `couldn't reach action menu for "${candidate.title}"`
+            })
           )
         }
-        yield* browseInZone({ item_key: playNow.item_key }, "fire play")
+
+        // 4. Match and fire action
+        const matcher = actionMatchers[mode]
+        const action = actionItems.find((a) => matcher(a.title.toLowerCase()))
+        if (!action?.item_key) {
+          return yield* Effect.fail(
+            new NoSearchResult({
+              query,
+              hint: `no ${mode} action for "${candidate.title}". available: ${actionItems.map((a) => a.title).join(", ")}`
+            })
+          )
+        }
+        yield* inSearch({ item_key: action.item_key }, `fire ${mode}`)
         return candidate.title
       })
 
-    return { waitForCore, getZones, findZone, control, searchAndPlay } as const
+    /**
+     * The Roon ws transport occasionally returns an empty response for the very
+     * first browse call after a fresh pair (closes the moo connection mid-flight).
+     * Retry transport-failed browses up to 3x with backoff.
+     */
+    const searchPolicy = Schedule.exponential("400 millis").pipe(
+      Schedule.intersect(Schedule.recurs(3))
+    )
+    const withRetry = <A, E, R>(eff: Effect.Effect<A, E, R>) =>
+      eff.pipe(
+        Effect.retry({
+          schedule: searchPolicy,
+          while: (e) =>
+            (e as { _tag?: string; reason?: string })._tag === "RoonBrowseFailed" &&
+            (e as { reason: string }).reason.includes("empty")
+        })
+      )
+
+    const searchAndPlay = (zoneOrOutputId: string, query: string) =>
+      withRetry(searchAndAct(zoneOrOutputId, query, "play_now", "Tracks"))
+    const searchAndQueue = (zoneOrOutputId: string, query: string) =>
+      withRetry(searchAndAct(zoneOrOutputId, query, "queue", "Tracks"))
+    const searchAndPlayNext = (zoneOrOutputId: string, query: string) =>
+      withRetry(searchAndAct(zoneOrOutputId, query, "play_next", "Tracks"))
+    const searchAlbumAndPlay = (zoneOrOutputId: string, query: string) =>
+      withRetry(searchAndAct(zoneOrOutputId, query, "play_now", "Albums"))
+    const searchAlbumAndQueue = (zoneOrOutputId: string, query: string) =>
+      withRetry(searchAndAct(zoneOrOutputId, query, "queue", "Albums"))
+    const searchArtistAndPlay = (zoneOrOutputId: string, query: string) =>
+      withRetry(searchAndAct(zoneOrOutputId, query, "play_now", "Artists"))
+
+    // ---- library browse ----
+
+    type LibraryCategory = "Artists" | "Albums" | "Tracks" | "Composers" | "Tags"
+
+    /**
+     * Lists items in a Library category. Returns up to `limit` titles.
+     */
+    const listLibrary = (zoneOrOutputId: string, category: LibraryCategory, limit = 100) =>
+      Effect.gen(function* () {
+        const core = yield* waitForCore
+        const opts = (extra: Partial<BrowseOpts>) =>
+          ({
+            hierarchy: "browse" as const,
+            zone_or_output_id: zoneOrOutputId,
+            ...extra
+          })
+        yield* tryBrowse(core, opts({ pop_all: true }), "open root")
+        const root = (yield* tryLoad(core, { hierarchy: "browse" }, "load root")).items
+        const lib = root.find((i) => i.title === "Library")
+        if (!lib?.item_key) {
+          return yield* Effect.fail(new RoonBrowseFailed({ stage: "find Library", reason: "missing" }))
+        }
+        yield* tryBrowse(core, opts({ item_key: lib.item_key }), "open Library")
+        const libItems = (yield* tryLoad(core, { hierarchy: "browse" }, "load Library")).items
+        const cat = libItems.find((i) => i.title === category)
+        if (!cat?.item_key) {
+          return yield* Effect.fail(
+            new RoonBrowseFailed({ stage: `find ${category}`, reason: "missing" })
+          )
+        }
+        yield* tryBrowse(core, opts({ item_key: cat.item_key }), `open ${category}`)
+        const out = (yield* tryLoad(core, { hierarchy: "browse", count: limit }, `load ${category}`))
+          .items
+        return out.filter((i) => i.title !== "..").slice(0, limit)
+      })
+
+    // ---- playlists ----
+
+    const listPlaylists = (zoneOrOutputId: string, limit = 100) =>
+      Effect.gen(function* () {
+        const core = yield* waitForCore
+        const opts = (extra: Partial<BrowseOpts>) =>
+          ({
+            hierarchy: "browse" as const,
+            zone_or_output_id: zoneOrOutputId,
+            ...extra
+          })
+        yield* tryBrowse(core, opts({ pop_all: true }), "open root")
+        const root = (yield* tryLoad(core, { hierarchy: "browse" }, "load root")).items
+        const pl = root.find((i) => i.title === "Playlists")
+        if (!pl?.item_key) {
+          return yield* Effect.fail(
+            new RoonBrowseFailed({ stage: "find Playlists", reason: "missing" })
+          )
+        }
+        yield* tryBrowse(core, opts({ item_key: pl.item_key }), "open Playlists")
+        const out = (yield* tryLoad(core, { hierarchy: "browse", count: limit }, "load Playlists"))
+          .items
+        return out
+      })
+
+    const playPlaylistByName = (zoneOrOutputId: string, name: string) =>
+      Effect.gen(function* () {
+        const playlists = yield* listPlaylists(zoneOrOutputId, 500)
+        const lower = name.toLowerCase()
+        const match =
+          playlists.find((p) => p.title.toLowerCase() === lower) ??
+          playlists.find((p) => p.title.toLowerCase().includes(lower))
+        if (!match?.item_key) {
+          return yield* Effect.fail(
+            new NoSearchResult({ query: name, hint: "no matching playlist" })
+          )
+        }
+        const core = yield* waitForCore
+        const opts = (extra: Partial<BrowseOpts>) =>
+          ({ hierarchy: "browse" as const, zone_or_output_id: zoneOrOutputId, ...extra })
+        yield* tryBrowse(core, opts({ item_key: match.item_key }), "open playlist")
+        const actions = (yield* tryLoad(core, { hierarchy: "browse" }, "load playlist actions")).items
+        const playNow = actions.find((a) => a.title.toLowerCase().includes("play now"))
+        if (!playNow?.item_key) {
+          return yield* Effect.fail(
+            new NoSearchResult({ query: name, hint: "no Play Now action on playlist" })
+          )
+        }
+        yield* tryBrowse(core, opts({ item_key: playNow.item_key }), "fire play playlist")
+        return match.title
+      })
+
+    return {
+      waitForCore,
+      getZones,
+      findZone,
+      control,
+      seek,
+      setVolume,
+      setMute,
+      changeSettings,
+      getQueue,
+      playFromHere,
+      clearQueue,
+      searchAndPlay,
+      searchAndQueue,
+      searchAndPlayNext,
+      searchAlbumAndPlay,
+      searchAlbumAndQueue,
+      searchArtistAndPlay,
+      listLibrary,
+      listPlaylists,
+      playPlaylistByName
+    } as const
   })
 }) {}
