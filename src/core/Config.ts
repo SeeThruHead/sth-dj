@@ -1,53 +1,65 @@
-import { Effect } from "effect"
-import * as os from "node:os"
-import * as path from "node:path"
-import * as fs from "node:fs/promises"
+import { Effect, Schema } from "effect"
+import { FileSystem } from "@effect/platform"
+import { Paths } from "./Paths.ts"
 
-export const configDir = path.join(os.homedir(), ".config", "sth-dj")
-export const roonStateFile = path.join(configDir, "roon-state.json")
-export const envFile = path.join(configDir, ".env")
+/**
+ * Service-agnostic file/JSON helpers built on @effect/platform/FileSystem.
+ * Errors flow through as `PlatformError` from the platform; services should
+ * map them to their own tagged errors at the boundary.
+ */
 
-export const ensureConfigDir = Effect.tryPromise({
-  try: () => fs.mkdir(configDir, { recursive: true }),
-  catch: (cause) => new Error(`failed to create config dir ${configDir}: ${cause}`)
-})
+export const ensureDir = (dir: string) =>
+  FileSystem.FileSystem.pipe(Effect.flatMap((fs) => fs.makeDirectory(dir, { recursive: true })))
 
-export const readJson = <T>(file: string): Effect.Effect<T | null, Error> =>
-  Effect.tryPromise({
-    try: async () => {
-      try {
-        const txt = await fs.readFile(file, "utf8")
-        return JSON.parse(txt) as T
-      } catch (e: unknown) {
-        if ((e as NodeJS.ErrnoException).code === "ENOENT") return null
-        throw e
-      }
-    },
-    catch: (cause) => new Error(`failed to read ${file}: ${cause}`)
-  })
+export const readFileText = (file: string) =>
+  FileSystem.FileSystem.pipe(Effect.flatMap((fs) => fs.readFileString(file)))
 
-export const writeJson = (file: string, value: unknown): Effect.Effect<void, Error> =>
-  Effect.tryPromise({
-    try: () => fs.writeFile(file, JSON.stringify(value, null, 2)),
-    catch: (cause) => new Error(`failed to write ${file}: ${cause}`)
-  })
+export const writeFileText = (file: string, content: string) =>
+  FileSystem.FileSystem.pipe(Effect.flatMap((fs) => fs.writeFileString(file, content)))
 
-export const readEnvFileInto = Effect.tryPromise({
-  try: async () => {
-    try {
-      const txt = await fs.readFile(envFile, "utf8")
-      for (const raw of txt.split("\n")) {
-        const line = raw.trim()
-        if (!line || line.startsWith("#")) continue
-        const eq = line.indexOf("=")
-        if (eq === -1) continue
-        const key = line.slice(0, eq).trim()
-        const val = line.slice(eq + 1).trim().replace(/^["']|["']$/g, "")
-        if (key && process.env[key] === undefined) process.env[key] = val
-      }
-    } catch (e: unknown) {
-      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e
+export const removeFile = (file: string) =>
+  FileSystem.FileSystem.pipe(Effect.flatMap((fs) => fs.remove(file, { force: true })))
+
+export const fileExists = (file: string) =>
+  FileSystem.FileSystem.pipe(
+    Effect.flatMap((fs) => fs.exists(file).pipe(Effect.orElseSucceed(() => false)))
+  )
+
+export const listDir = (dir: string) =>
+  FileSystem.FileSystem.pipe(Effect.flatMap((fs) => fs.readDirectory(dir)))
+
+export const writeJson = (file: string, value: unknown) =>
+  writeFileText(file, JSON.stringify(value, null, 2))
+
+export const readJsonAs = <A, I>(file: string, schema: Schema.Schema<A, I>) =>
+  readFileText(file).pipe(
+    Effect.flatMap((text) =>
+      Effect.try({
+        try: () => JSON.parse(text) as unknown,
+        catch: (cause) => new Error(`invalid JSON in ${file}: ${cause}`)
+      })
+    ),
+    Effect.flatMap((parsed) => Schema.decodeUnknown(schema)(parsed))
+  )
+
+/**
+ * Loads ~/.config/sth-dj/.env into process.env (only for keys not already set).
+ * Side effect contained behind an Effect; no-op when file missing.
+ */
+export const loadEnvFile = Effect.gen(function* () {
+  const paths = yield* Paths
+  const exists = yield* fileExists(paths.envFile)
+  if (!exists) return
+  const txt = yield* readFileText(paths.envFile)
+  yield* Effect.sync(() => {
+    for (const raw of txt.split("\n")) {
+      const line = raw.trim()
+      if (!line || line.startsWith("#")) continue
+      const eq = line.indexOf("=")
+      if (eq === -1) continue
+      const key = line.slice(0, eq).trim()
+      const val = line.slice(eq + 1).trim().replace(/^["']|["']$/g, "")
+      if (key && process.env[key] === undefined) process.env[key] = val
     }
-  },
-  catch: (cause) => new Error(`failed to read ${envFile}: ${cause}`)
+  })
 })

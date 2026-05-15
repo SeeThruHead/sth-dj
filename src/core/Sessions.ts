@@ -1,7 +1,8 @@
-import { Context, Effect, Layer, Schema } from "effect"
-import * as fs from "node:fs/promises"
-import * as path from "node:path"
-import { configDir, ensureConfigDir } from "./Config.ts"
+import { Effect, Schema, Option } from "effect"
+import { FileSystem } from "@effect/platform"
+import { Paths } from "./Paths.ts"
+
+// ---- schema ----
 
 export const SessionEntry = Schema.Struct({
   ts: Schema.String,
@@ -22,144 +23,161 @@ export const Session = Schema.Struct({
 })
 export type Session = Schema.Schema.Type<typeof Session>
 
-const sessionsDir = path.join(configDir, "sessions")
-const pointerFile = path.join(configDir, "current-session.json")
-
 const Pointer = Schema.Struct({ id: Schema.String })
 
-const ensureSessionsDir = Effect.tryPromise({
-  try: () => fs.mkdir(sessionsDir, { recursive: true }),
-  catch: (cause) => new Error(`failed to create sessions dir: ${cause}`)
-})
+// ---- errors (per-service) ----
 
-const sessionPath = (id: string) => path.join(sessionsDir, `${id}.json`)
+export class SessionNotFound extends Schema.TaggedError<SessionNotFound>()(
+  "SessionNotFound",
+  { id: Schema.String }
+) {}
 
-const readSessionFile = (id: string) =>
-  Effect.tryPromise({
-    try: () => fs.readFile(sessionPath(id), "utf8"),
-    catch: (cause) => new Error(`failed to read session ${id}: ${cause}`)
-  }).pipe(
-    Effect.flatMap((txt) =>
-      Schema.decodeUnknown(Session)(JSON.parse(txt)).pipe(
-        Effect.mapError((e) => new Error(`invalid session ${id}: ${e}`))
-      )
-    )
-  )
+export class SessionPersistError extends Schema.TaggedError<SessionPersistError>()(
+  "SessionPersistError",
+  { op: Schema.String, reason: Schema.String }
+) {}
 
-const writeSessionFile = (s: Session) =>
-  Effect.tryPromise({
-    try: () => fs.writeFile(sessionPath(s.id), JSON.stringify(s, null, 2)),
-    catch: (cause) => new Error(`failed to write session ${s.id}: ${cause}`)
-  })
+export class SessionDecodeError extends Schema.TaggedError<SessionDecodeError>()(
+  "SessionDecodeError",
+  { what: Schema.String, reason: Schema.String }
+) {}
 
-const readPointer: Effect.Effect<string | null, Error> = Effect.tryPromise({
-  try: async () => {
-    try {
-      return await fs.readFile(pointerFile, "utf8")
-    } catch (e: unknown) {
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") return null
-      throw e
-    }
-  },
-  catch: (cause) => new Error(`failed to read current-session pointer: ${cause}`)
-}).pipe(
-  Effect.flatMap((txt) =>
-    txt === null
-      ? Effect.succeed(null)
-      : Schema.decodeUnknown(Pointer)(JSON.parse(txt)).pipe(
-          Effect.map((p) => p.id),
-          Effect.mapError((e) => new Error(`invalid pointer file: ${e}`))
-        )
-  )
-)
+// ---- helpers ----
 
-const writePointer = (id: string | null) =>
-  Effect.tryPromise({
-    try: () =>
-      id === null
-        ? fs.rm(pointerFile, { force: true })
-        : fs.writeFile(pointerFile, JSON.stringify({ id }, null, 2)),
-    catch: (cause) => new Error(`failed to update pointer: ${cause}`)
-  })
-
-const newId = () => {
+const newId = Effect.sync(() => {
   const d = new Date()
   const pad = (n: number) => n.toString().padStart(2, "0")
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
-}
-
-export class Sessions extends Context.Tag("sth-dj/Sessions")<
-  Sessions,
-  {
-    readonly start: (name: string) => Effect.Effect<Session, Error>
-    readonly end: Effect.Effect<Session | null, Error>
-    readonly current: Effect.Effect<Session | null, Error>
-    readonly list: Effect.Effect<Session[], Error>
-    readonly get: (id: string) => Effect.Effect<Session, Error>
-    readonly append: (entry: Omit<SessionEntry, "ts">) => Effect.Effect<void, Error>
-  }
->() {}
-
-const make = Effect.gen(function* () {
-  yield* ensureConfigDir
-  yield* ensureSessionsDir
-
-  const start = (name: string) =>
-    Effect.gen(function* () {
-      const id = newId()
-      const session: Session = {
-        id,
-        name,
-        startedAt: new Date().toISOString(),
-        entries: []
-      }
-      yield* writeSessionFile(session)
-      yield* writePointer(id)
-      return session
-    })
-
-  const current = readPointer.pipe(
-    Effect.flatMap((id) => (id === null ? Effect.succeed(null) : readSessionFile(id)))
-  )
-
-  const end = Effect.gen(function* () {
-    const cur = yield* current
-    if (cur === null) return null
-    const ended: Session = { ...cur, endedAt: new Date().toISOString() }
-    yield* writeSessionFile(ended)
-    yield* writePointer(null)
-    return ended
-  })
-
-  const list = Effect.gen(function* () {
-    const files = yield* Effect.tryPromise({
-      try: () => fs.readdir(sessionsDir),
-      catch: (cause) => new Error(`failed to list sessions dir: ${cause}`)
-    })
-    const sessions: Session[] = []
-    for (const f of files) {
-      if (!f.endsWith(".json")) continue
-      const id = f.slice(0, -".json".length)
-      const s = yield* readSessionFile(id).pipe(Effect.either)
-      if (s._tag === "Right") sessions.push(s.right)
-    }
-    return sessions.sort((a, b) => b.startedAt.localeCompare(a.startedAt))
-  })
-
-  const get = (id: string) => readSessionFile(id)
-
-  const append = (entry: Omit<SessionEntry, "ts">) =>
-    Effect.gen(function* () {
-      const cur = yield* current
-      if (cur === null) return
-      const next: Session = {
-        ...cur,
-        entries: [...cur.entries, { ...entry, ts: new Date().toISOString() }]
-      }
-      yield* writeSessionFile(next)
-    })
-
-  return Sessions.of({ start, end, current, list, get, append })
 })
 
-export const SessionsLive = Layer.effect(Sessions, make)
+const nowIso = Effect.sync(() => new Date().toISOString())
+
+const mapPersist = (op: string) =>
+  <A, R>(eff: Effect.Effect<A, unknown, R>) =>
+    eff.pipe(Effect.mapError((cause) => new SessionPersistError({ op, reason: String(cause) })))
+
+const mapDecode = (what: string) =>
+  <A, R>(eff: Effect.Effect<A, unknown, R>) =>
+    eff.pipe(Effect.mapError((cause) => new SessionDecodeError({ what, reason: String(cause) })))
+
+// ---- service ----
+
+export class Sessions extends Effect.Service<Sessions>()("sth-dj/Sessions", {
+  effect: Effect.gen(function* () {
+    const paths = yield* Paths
+    const fs = yield* FileSystem.FileSystem
+
+    yield* fs.makeDirectory(paths.configDir, { recursive: true }).pipe(mapPersist("ensure config dir"))
+    yield* fs.makeDirectory(paths.sessionsDir, { recursive: true }).pipe(mapPersist("ensure sessions dir"))
+
+    const sessionFile = (id: string) => `${paths.sessionsDir}/${id}.json`
+
+    const readJsonFile = <A, I>(file: string, schema: Schema.Schema<A, I>, what: string) =>
+      fs.readFileString(file).pipe(
+        Effect.flatMap((text) =>
+          Effect.try({
+            try: () => JSON.parse(text) as unknown,
+            catch: (cause) => new SessionDecodeError({ what, reason: `invalid JSON: ${cause}` })
+          })
+        ),
+        Effect.flatMap((parsed) =>
+          Schema.decodeUnknown(schema)(parsed).pipe(
+            Effect.mapError((e) => new SessionDecodeError({ what, reason: String(e) }))
+          )
+        )
+      )
+
+    const readSession = (id: string) =>
+      readJsonFile(sessionFile(id), Session, `session ${id}`).pipe(
+        Effect.catchTag("SystemError", () => new SessionNotFound({ id })),
+        Effect.catchTag("BadArgument", () => new SessionNotFound({ id }))
+      )
+
+    const writeSession = (s: Session) =>
+      fs.writeFileString(sessionFile(s.id), JSON.stringify(s, null, 2)).pipe(
+        mapPersist(`write session ${s.id}`)
+      )
+
+    const readPointer = fs.exists(paths.pointerFile).pipe(
+      Effect.orElseSucceed(() => false),
+      Effect.flatMap((exists) =>
+        exists
+          ? readJsonFile(paths.pointerFile, Pointer, "pointer").pipe(
+              Effect.map((p) => Option.some(p.id))
+            )
+          : Effect.succeed(Option.none<string>())
+      )
+    )
+
+    const writePointer = (id: Option.Option<string>) =>
+      Option.match(id, {
+        onNone: () => fs.remove(paths.pointerFile, { force: true }).pipe(mapPersist("clear pointer")),
+        onSome: (id) =>
+          fs.writeFileString(paths.pointerFile, JSON.stringify({ id }, null, 2)).pipe(
+            mapPersist("write pointer")
+          )
+      })
+
+    const start = (name: string) =>
+      Effect.all({ id: newId, startedAt: nowIso }).pipe(
+        Effect.map(({ id, startedAt }): Session => ({ id, name, startedAt, entries: [] })),
+        Effect.tap(writeSession),
+        Effect.tap((s) => writePointer(Option.some(s.id)))
+      )
+
+    const current = readPointer.pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () => Effect.succeed(Option.none<Session>()),
+          onSome: (id) => readSession(id).pipe(Effect.map(Option.some))
+        })
+      )
+    )
+
+    const end = current.pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () => Effect.succeed(Option.none<Session>()),
+          onSome: (cur) =>
+            nowIso.pipe(
+              Effect.map((endedAt): Session => ({ ...cur, endedAt })),
+              Effect.tap(writeSession),
+              Effect.tap(() => writePointer(Option.none())),
+              Effect.map(Option.some)
+            )
+        })
+      )
+    )
+
+    const get = (id: string) => readSession(id)
+
+    const list = fs.readDirectory(paths.sessionsDir).pipe(
+      mapPersist("list sessions dir"),
+      Effect.flatMap((files) =>
+        Effect.forEach(
+          files.filter((f) => f.endsWith(".json")),
+          (f) => readSession(f.slice(0, -".json".length)).pipe(Effect.option),
+          { concurrency: "unbounded" }
+        )
+      ),
+      Effect.map((opts) => opts.filter(Option.isSome).map((o) => o.value)),
+      Effect.map((all) => [...all].sort((a, b) => b.startedAt.localeCompare(a.startedAt)))
+    )
+
+    const append = (entry: Omit<SessionEntry, "ts">) =>
+      current.pipe(
+        Effect.flatMap(
+          Option.match({
+            onNone: () => Effect.void,
+            onSome: (cur) =>
+              nowIso.pipe(
+                Effect.map((ts): Session => ({ ...cur, entries: [...cur.entries, { ...entry, ts }] })),
+                Effect.flatMap(writeSession)
+              )
+          })
+        )
+      )
+
+    return { start, end, current, get, list, append } as const
+  })
+}) {}
