@@ -30,7 +30,7 @@ Works on macOS, Linux, and Windows via WSL2. See [WSL2 networking](#wsl2-network
 ## Install
 
 ```bash
-git clone https://github.com/YOUR-USER/sth-dj.git
+git clone https://github.com/SeeThruHead/sth-dj.git
 cd sth-dj
 pnpm install
 ```
