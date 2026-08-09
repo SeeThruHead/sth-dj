@@ -4,9 +4,9 @@ A command-line remote for [Roon](https://roon.app), built so an AI agent can DJ 
 
 The CLI does the talking to Roon — search, queue, transport, browse. Something else (you, a shell script, an LLM) decides what to play. Every command is one shot: it connects, does the thing, prints a line, exits.
 
-https://github.com/SeeThruHead/sth-dj/raw/main/docs/demo.mp4
+![sth-dj queueing a pop punk history into Roon](docs/demo.gif)
 
-Asking for a history of pop punk: the agent writes the history and queues the tracks in Roon as it goes.
+Asking for a history of pop punk: the agent writes the history and queues the tracks in Roon as it goes. ([full-quality video](docs/demo.mp4))
 
 ```console
 $ sth-dj play "Search and Destroy Stooges"
