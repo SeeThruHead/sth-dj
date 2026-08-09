@@ -165,11 +165,24 @@ Logs are plain JSON in `~/.config/sth-dj/sessions/`, one file per session. Each 
 
 ## Using it with an AI agent
 
-The CLI is the hands; the model is the taste. A workable system prompt is "you are a curator, use `sth-dj` to control playback, always pass `--json` when you need to read output". Two things make a real difference:
+This is the point of the whole thing. The CLI is the hands; the model is the taste.
 
-**Clear the queue before building a set.** With `radio` on, Roon continuously appends its own picks. If you append without clearing, your tracks sit *behind* Roon's, and the set plays in the wrong order.
+A ready-made [Claude Code](https://claude.com/claude-code) skill ships in [`skills/sth-dj/`](skills/sth-dj/SKILL.md). Install it:
+
+```bash
+mkdir -p ~/.claude/skills
+cp -R skills/sth-dj ~/.claude/skills/
+```
+
+Then ask for music in plain language — "give me a history of pop punk", "put on something like Aurora", "what's playing?" — and the agent drives Roon. The skill teaches it the command surface plus the two things that actually matter:
+
+**Clear the queue before building a set.** With `radio` on, Roon continuously appends its own picks. If you append without clearing, your tracks sit *behind* Roon's and the set plays in the wrong order.
 
 **Handle empty search results.** A too-specific query returns nothing. Retry with just the artist, or pick a different track — don't loop on the same string.
+
+It also splits behaviour into two modes: *curator* (narrate every pick, give context, check in) and *utility* (just queue the music, no lecture). It picks based on how you phrase the request.
+
+The skill is plain Markdown with no Claude-specific magic beyond the frontmatter, so it works as a system prompt for any agent that can run shell commands.
 
 ## Troubleshooting
 
