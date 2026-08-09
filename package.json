@@ -1,11 +1,20 @@
 {
   "name": "sth-dj",
   "version": "0.0.0",
+  "description": "A command-line remote for Roon, built so an AI agent can DJ your library",
+  "license": "MIT",
+  "keywords": [
+    "roon",
+    "music",
+    "cli",
+    "agent",
+    "effect"
+  ],
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.1.2",
   "engines": {
-    "node": ">=22",
+    "node": ">=22.6",
     "pnpm": ">=11"
   },
   "pnpm": {

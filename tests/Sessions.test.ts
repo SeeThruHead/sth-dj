@@ -40,7 +40,7 @@ describe("Sessions", () => {
 
         yield* sessions.append({
           action: "play",
-          zone: "K17",
+          zone: "Living Room",
           query: "Aurora Runaway",
           resolved: "Runaway"
         })
@@ -114,7 +114,7 @@ describe("Sessions", () => {
         const sessions = yield* Sessions
         yield* sessions.append({
           action: "play",
-          zone: "K17",
+          zone: "Living Room",
           query: "anything"
         })
         const all = yield* sessions.list

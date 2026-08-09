@@ -15,9 +15,12 @@ export class Paths extends Effect.Service<Paths>()("sth-dj/Paths", {
   effect: Effect.gen(function* () {
     const path = yield* Path.Path
     const home = yield* homeDir
-    const configDir = path.join(home, ".config", "sth-dj")
+    const xdg = process.env.XDG_CONFIG_HOME
+    const base = xdg && path.isAbsolute(xdg) ? xdg : path.join(home, ".config")
+    const configDir = path.join(base, "sth-dj")
     return {
       configDir,
+      configFile: path.join(configDir, "config.json"),
       roonStateFile: path.join(configDir, "roon-state.json"),
       envFile: path.join(configDir, ".env"),
       sessionsDir: path.join(configDir, "sessions"),

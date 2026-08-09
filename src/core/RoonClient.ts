@@ -6,6 +6,7 @@ import RoonApiBrowse from "node-roon-api-browse"
 import RoonApiImage from "node-roon-api-image"
 import RoonApiStatus from "node-roon-api-status"
 import { Paths } from "./Paths.ts"
+import { AppConfig } from "./AppConfig.ts"
 
 // ---- public types ----
 
@@ -131,9 +132,11 @@ type PersistedState = Schema.Schema.Type<typeof PersistedState>
 // ---- FFI bridge (sealed, see comment) ----
 
 const acquireRoon = (
+  identity: { publisher: string; email: string },
   initialState: PersistedState,
   onPersist: (s: PersistedState) => void,
-  onPaired: (core: RawCore) => void
+  onPaired: (core: RawCore) => void,
+  onUnpaired: () => void
 ) =>
   Effect.try({
     try: () => {
@@ -142,8 +145,8 @@ const acquireRoon = (
         extension_id: "com.sth.dj",
         display_name: "STH DJ",
         display_version: "0.0.1",
-        publisher: "sth",
-        email: "shane.keulen@gmail.com",
+        publisher: identity.publisher,
+        email: identity.email,
         log_level: "none",
         set_persisted_state: (s: PersistedState) => {
           MutableRef.set(state, s)
@@ -151,7 +154,7 @@ const acquireRoon = (
         },
         get_persisted_state: () => MutableRef.get(state),
         core_paired: (core: unknown) => onPaired(core as RawCore),
-        core_unpaired: () => {}
+        core_unpaired: () => onUnpaired()
       })
       ;(roon as unknown as {
         init_services: (o: { required_services: unknown[]; provided_services: unknown[] }) => void
@@ -171,6 +174,7 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
   effect: Effect.gen(function* () {
     const paths = yield* Paths
     const fs = yield* FileSystem.FileSystem
+    const appConfig = yield* AppConfig
     yield* fs.makeDirectory(paths.configDir, { recursive: true }).pipe(
       Effect.mapError((cause) => new RoonPairingFailed({ reason: `config dir: ${cause}` }))
     )
@@ -214,10 +218,15 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
             ),
             Effect.catchAll(() => Effect.void)
           )
+        const identity = yield* appConfig.load.pipe(
+          Effect.mapError((err) => new RoonPairingFailed({ reason: err.reason }))
+        )
         yield* acquireRoon(
+          identity,
           initial,
           (s) => Effect.runFork(persist(s)),
-          (core) => Effect.runFork(Deferred.succeed(deferred, core))
+          (core) => Effect.runFork(Deferred.succeed(deferred, core)),
+          () => Effect.runFork(Ref.set(startedRef, Option.none()))
         ).pipe(Effect.tapError((err) => Deferred.fail(deferred, err)))
       }
       return updated
@@ -226,6 +235,30 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
     const waitForCore = ensureStarted.pipe(Effect.flatMap(Deferred.await))
 
     // ---- callback wrappers ----
+
+    const transportCall = <A>(
+      action: string,
+      register: (resume: (effect: Effect.Effect<A, RoonTransportFailed>) => void) => void
+    ) =>
+      Effect.async<A, RoonTransportFailed>((resume) => {
+        try {
+          register(resume)
+        } catch (cause) {
+          resume(Effect.fail(new RoonTransportFailed({ action, reason: String(cause) })))
+        }
+      })
+
+    const browseCall = <A>(
+      stage: string,
+      register: (resume: (effect: Effect.Effect<A, RoonBrowseFailed>) => void) => void
+    ) =>
+      Effect.async<A, RoonBrowseFailed>((resume) => {
+        try {
+          register(resume)
+        } catch (cause) {
+          resume(Effect.fail(new RoonBrowseFailed({ stage, reason: String(cause) })))
+        }
+      })
 
     const successOrFail = (action: string) => (msg: unknown) =>
       Match.value(msg).pipe(
@@ -241,7 +274,7 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
       )
 
     const tryGetZones = (core: RawCore) =>
-      Effect.async<RoonZone[], RoonTransportFailed>((resume) => {
+      transportCall<RoonZone[]>("get_zones", (resume) => {
         core.services.RoonApiTransport.get_zones((_msg, body) => {
           if (!body?.zones) {
             resume(
@@ -256,45 +289,50 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
       })
 
     const tryControl = (core: RawCore, zoneId: string, action: TransportAction) =>
-      Effect.async<void, RoonTransportFailed>((resume) => {
+      transportCall<void>(action, (resume) => {
         core.services.RoonApiTransport.control(zoneId, action, (msg) =>
           resume(successOrFail(action)(msg))
         )
       })
 
     const trySeek = (core: RawCore, zoneId: string, seconds: number, mode: "absolute" | "relative") =>
-      Effect.async<void, RoonTransportFailed>((resume) => {
+      transportCall<void>(`seek ${mode}`, (resume) => {
         core.services.RoonApiTransport.seek(zoneId, mode, seconds, (msg) =>
           resume(successOrFail(`seek ${mode}`)(msg))
         )
       })
 
     const tryChangeVolume = (core: RawCore, outputId: string, value: number, mode: "absolute" | "relative" | "relative_step") =>
-      Effect.async<void, RoonTransportFailed>((resume) => {
+      transportCall<void>(`volume ${mode}`, (resume) => {
         core.services.RoonApiTransport.change_volume(outputId, mode, value, (msg) =>
           resume(successOrFail(`volume ${mode}`)(msg))
         )
       })
 
     const tryMute = (core: RawCore, outputId: string, on: boolean) =>
-      Effect.async<void, RoonTransportFailed>((resume) => {
+      transportCall<void>(on ? "mute" : "unmute", (resume) => {
         core.services.RoonApiTransport.mute(outputId, on ? "mute" : "unmute", (msg) =>
           resume(successOrFail(on ? "mute" : "unmute")(msg))
         )
       })
 
     const tryChangeSettings = (core: RawCore, zoneId: string, settings: object) =>
-      Effect.async<void, RoonTransportFailed>((resume) => {
+      transportCall<void>("change_settings", (resume) => {
         core.services.RoonApiTransport.change_settings(zoneId, settings, (msg) =>
           resume(successOrFail("change_settings")(msg))
         )
       })
 
+    /**
+     * Roon acts on play_from_here but never answers it, so waiting on the
+     * callback stalls until the websocket heartbeat gives up (~20-30s).
+     * Requests are ordered over the same connection, so resuming immediately
+     * still sequences correctly against the calls that follow.
+     */
     const tryPlayFromHere = (core: RawCore, outputId: string, queueItemId: number) =>
-      Effect.async<void, RoonTransportFailed>((resume) => {
-        core.services.RoonApiTransport.play_from_here(outputId, queueItemId, (msg) =>
-          resume(successOrFail("play_from_here")(msg))
-        )
+      transportCall<void>("play_from_here", (resume) => {
+        core.services.RoonApiTransport.play_from_here(outputId, queueItemId)
+        resume(Effect.void)
       })
 
     /**
@@ -302,7 +340,7 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
      * The Roon transport pushes initial items on subscription.
      */
     const tryGetQueue = (core: RawCore, zoneOrOutputId: string, max: number) =>
-      Effect.async<QueueItem[], RoonTransportFailed>((resume) => {
+      transportCall<QueueItem[]>("subscribe_queue", (resume) => {
         core.services.RoonApiTransport.subscribe_queue(zoneOrOutputId, max, (response, body) => {
           if (response === "Subscribed" && body.items) {
             resume(Effect.succeed(body.items))
@@ -311,7 +349,7 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
       })
 
     const tryBrowse = (core: RawCore, opts: BrowseOpts, stage: string) =>
-      Effect.async<BrowseResponse, RoonBrowseFailed>((resume) => {
+      browseCall<BrowseResponse>(stage, (resume) => {
         core.services.RoonApiBrowse.browse(opts, (_msg, body) => {
           if (!body) {
             resume(Effect.fail(new RoonBrowseFailed({ stage, reason: "empty browse response" })))
@@ -322,7 +360,7 @@ export class RoonClient extends Effect.Service<RoonClient>()("sth-dj/RoonClient"
       })
 
     const tryLoad = (core: RawCore, opts: LoadOpts, stage: string) =>
-      Effect.async<LoadResponse, RoonBrowseFailed>((resume) => {
+      browseCall<LoadResponse>(stage, (resume) => {
         core.services.RoonApiBrowse.load(opts, (_msg, body) => {
           if (!body) {
             resume(Effect.fail(new RoonBrowseFailed({ stage, reason: "empty load response" })))

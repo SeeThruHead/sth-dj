@@ -23,6 +23,7 @@ export const cleanupDir = (dir: string) =>
 export const TestPathsLayer = (root: string) =>
   Layer.succeed(Paths, {
     configDir: root,
+    configFile: path.join(root, "config.json"),
     roonStateFile: path.join(root, "roon-state.json"),
     envFile: path.join(root, ".env"),
     sessionsDir: path.join(root, "sessions"),

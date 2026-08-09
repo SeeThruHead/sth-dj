@@ -1,6 +1,7 @@
 import { Args, Command, Options } from "@effect/cli"
 import { Console, Effect, Match, Option } from "effect"
 import { RoonClient, type RoonZone, type TransportAction, ZoneNotFound } from "../core/RoonClient.ts"
+import { AppConfig } from "../core/AppConfig.ts"
 import { Sessions } from "../core/Sessions.ts"
 
 const zoneOpt = Options.text("zone").pipe(
@@ -16,7 +17,7 @@ const jsonOpt = Options.boolean("json").pipe(
 
 const queryArg = Args.text({ name: "query" })
 
-const pickZone = (zones: RoonZone[], query: Option.Option<string>): Effect.Effect<RoonZone, ZoneNotFound> =>
+export const pickZone = (zones: RoonZone[], query: Option.Option<string>): Effect.Effect<RoonZone, ZoneNotFound> =>
   Option.match(query, {
     onNone: () => {
       const playing = zones.find((z) => z.state === "playing") ?? zones[0]
@@ -35,11 +36,20 @@ const withZone = <A, E, R>(
   zone: Option.Option<string>,
   body: (z: RoonZone) => Effect.Effect<A, E, R>
 ) =>
-  RoonClient.pipe(
-    Effect.flatMap((roon) => roon.getZones),
-    Effect.flatMap((zs) => pickZone(zs, zone)),
-    Effect.flatMap(body)
-  )
+  Effect.gen(function* () {
+    const roon = yield* RoonClient
+    const configured = yield* AppConfig.pipe(Effect.flatMap((c) => c.defaultZone))
+    const zs = yield* roon.getZones
+    const requested = Option.orElse(zone, () => configured)
+    const picked = yield* pickZone(zs, requested).pipe(
+      Effect.catchTag("ZoneNotFound", (err) =>
+        Option.isNone(zone) && Option.isSome(configured)
+          ? pickZone(zs, Option.none())
+          : Effect.fail(err)
+      )
+    )
+    return yield* body(picked)
+  })
 
 // ---- zones ----
 const zones = Command.make("zones", { json: jsonOpt }, ({ json }) =>
